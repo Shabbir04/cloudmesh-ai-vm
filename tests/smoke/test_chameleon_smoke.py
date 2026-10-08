@@ -4,10 +4,10 @@ Smoke test for the Chameleon (KVM@TACC) provider against the real cloud.
 Lifecycle: start -> wait running -> info -> list -> floating IP -> run (SSH)
 -> stop -> wait stopped -> restart -> wait running -> delete -> verify gone.
 
-KVM@TACC only boots VMs on a reserved flavor, so create a lease first
-(dashboard: Reservations -> Leases, 1 x m1.small) and pass its flavor:
+KVM@TACC boots regular flavors on demand (no lease needed). Optional
+settings, with defaults:
 
-    export CHAMELEON_FLAVOR=reservation:<reservation-id>
+    export CHAMELEON_FLAVOR=m1.small                    # or reservation:<id>
     export CHAMELEON_KEY_NAME=<keypair name in Chameleon>
     export CHAMELEON_KEY_PATH=~/.ssh/id_ed25519        # matching private key
     export CHAMELEON_SECURITY_GROUP=<group allowing tcp/22>
@@ -32,7 +32,7 @@ import yaml
 from cloudmesh.ai.common.stopwatch import StopWatch
 from cloudmesh.ai.vm.openstack.OpenstackManager import OpenstackManager
 
-FLAVOR = os.environ.get("CHAMELEON_FLAVOR")
+FLAVOR = os.environ.get("CHAMELEON_FLAVOR", "m1.small")
 OS_CLOUDS = os.path.expanduser("~/.config/openstack/clouds.yaml")
 
 
@@ -45,8 +45,8 @@ def has_chameleon_credentials():
 
 
 pytestmark = pytest.mark.skipif(
-    not (FLAVOR and has_chameleon_credentials() and shutil.which("openstack")),
-    reason="needs CHAMELEON_FLAVOR, a 'chameleon' entry in ~/.config/openstack/clouds.yaml and the openstack CLI",
+    not (has_chameleon_credentials() and shutil.which("openstack")),
+    reason="needs a 'chameleon' entry in ~/.config/openstack/clouds.yaml and the openstack CLI",
 )
 
 
