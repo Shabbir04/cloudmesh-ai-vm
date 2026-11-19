@@ -1,3 +1,5 @@
+import ipaddress
+import random
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +20,61 @@ MOCK_CONFIG = {
 }
 
 
+def _random_ips(count):
+    """Return ``count`` different random IPv4 addresses.
+
+    The list() tests use new addresses on every run, so they cannot pass by
+    matching one fixed IP.
+    """
+    ips = set()
+    while len(ips) < count:
+        ips.add(str(ipaddress.IPv4Address(random.getrandbits(32))))
+    return list(ips)
+
+
+# Address layouts as returned by openstacksdk in ``server.addresses``.
+# Each builds the mapping from a fixed and a floating IP and returns the
+# floating IP that list() must report ("No IP" when there is none).
+LIST_ADDRESS_LAYOUTS = {
+    # Jetstream: one network, floating IP marked by OS-EXT-IPS:type
+    "floating_after_fixed": lambda fixed, fip: (
+        {
+            "auto_allocated_network": [
+                {"addr": fixed, "OS-EXT-IPS:type": "fixed"},
+                {"addr": fip, "OS-EXT-IPS:type": "floating"},
+            ]
+        },
+        fip,
+    ),
+    "floating_before_fixed": lambda fixed, fip: (
+        {
+            "auto_allocated_network": [
+                {"addr": fip, "OS-EXT-IPS:type": "floating"},
+                {"addr": fixed, "OS-EXT-IPS:type": "fixed"},
+            ]
+        },
+        fip,
+    ),
+    "floating_on_second_network": lambda fixed, fip: (
+        {
+            "private": [{"addr": fixed, "OS-EXT-IPS:type": "fixed"}],
+            "public": [{"addr": fip, "OS-EXT-IPS:type": "floating"}],
+        },
+        fip,
+    ),
+    # Network literally named "floating" (no OS-EXT-IPS:type)
+    "network_named_floating": lambda fixed, fip: (
+        {"private": [{"addr": fixed}], "floating": [{"addr": fip}]},
+        fip,
+    ),
+    "fixed_only": lambda fixed, fip: (
+        {"auto_allocated_network": [{"addr": fixed, "OS-EXT-IPS:type": "fixed"}]},
+        "No IP",
+    ),
+    "no_addresses": lambda fixed, fip: (None, "No IP"),
+}
+
+
 class TestOpenstackDetailed:
     """
     Detailed unit tests for OpenstackManager focused on CLI fallbacks,
@@ -33,14 +90,15 @@ class TestOpenstackDetailed:
 
     def test_list_sdk_success(self, provider):
         conn = MagicMock()
+        fixed, fip = _random_ips(2)
 
         server = SimpleNamespace(
             name="vm1",
             id="id1",
             status="ACTIVE",
             addresses={
-                "private": [{"addr": "10.0.0.1"}],
-                "floating": [{"addr": "1.2.3.4"}],
+                "private": [{"addr": fixed}],
+                "floating": [{"addr": fip}],
             },
             image=SimpleNamespace(name="img1"),
             flavor=SimpleNamespace(name="flv1"),
@@ -55,35 +113,16 @@ class TestOpenstackDetailed:
         assert vms[0]["name"] == "vm1"
         assert vms[0]["id"] == "id1"
         assert vms[0]["status"] == "ACTIVE"
-        assert vms[0]["ip"] == "1.2.3.4"
+        assert vms[0]["ip"] == fip
         assert vms[0]["image"] == "img1"
         assert vms[0]["flavor"] == "flv1"
 
-    @pytest.mark.parametrize(
-        ("addresses", "expected_ip"),
-        [
-            # Real openstacksdk format on Jetstream: one network, the floating
-            # IP is marked by OS-EXT-IPS:type.
-            (
-                {
-                    "auto_allocated_network": [
-                        {"addr": "10.0.140.67", "OS-EXT-IPS:type": "fixed"},
-                        {"addr": "149.165.169.251", "OS-EXT-IPS:type": "floating"},
-                    ]
-                },
-                "149.165.169.251",
-            ),
-            # No floating IP attached.
-            (
-                {"auto_allocated_network": [{"addr": "10.0.140.67", "OS-EXT-IPS:type": "fixed"}]},
-                "No IP",
-            ),
-            # No addresses at all.
-            (None, "No IP"),
-        ],
-    )
-    def test_list_sdk_floating_ip_by_type(self, provider, addresses, expected_ip):
-        """list() finds the floating IP by its OS-EXT-IPS:type, not by network name."""
+    @pytest.mark.parametrize("layout", sorted(LIST_ADDRESS_LAYOUTS))
+    def test_list_sdk_floating_ip_by_type(self, provider, layout):
+        """list() finds the floating IP by its OS-EXT-IPS:type for any address."""
+        fixed, fip = _random_ips(2)
+        addresses, expected_ip = LIST_ADDRESS_LAYOUTS[layout](fixed, fip)
+
         conn = MagicMock()
         server = SimpleNamespace(
             name="vm1",
@@ -99,6 +138,36 @@ class TestOpenstackDetailed:
             vms = provider.list()
 
         assert vms[0]["ip"] == expected_ip
+
+    def test_list_sdk_floating_ip_per_server(self, provider):
+        """Each server gets its own floating IP; nothing is shared or reused."""
+        servers, expected = [], {}
+        for index in range(5):
+            fixed, fip = _random_ips(2)
+            servers.append(
+                SimpleNamespace(
+                    name=f"vm{index}",
+                    id=f"id{index}",
+                    status="ACTIVE",
+                    addresses={
+                        "net": [
+                            {"addr": fixed, "OS-EXT-IPS:type": "fixed"},
+                            {"addr": fip, "OS-EXT-IPS:type": "floating"},
+                        ]
+                    },
+                    image=SimpleNamespace(name="img1"),
+                    flavor=SimpleNamespace(name="flv1"),
+                )
+            )
+            expected[f"id{index}"] = fip
+
+        conn = MagicMock()
+        conn.compute.servers.return_value = servers
+
+        with patch.object(provider, "_get_sdk_conn", return_value=conn):
+            vms = provider.list()
+
+        assert {vm["id"]: vm["ip"] for vm in vms} == expected
 
     def test_get_floating_ip_success(self, provider):
         """Verify _get_floating_ip correctly parses the 'addresses' output."""
